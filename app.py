@@ -1,5 +1,5 @@
 import gradio as gr
-import click
+
 from clip_interrogator import Config, Interrogator
 from utils import get_image_files
 from PIL import Image
@@ -7,13 +7,13 @@ import os
 from tqdm import tqdm
 import torch
 
-
 MODEL = None
 
 
 def load_model(
         model_name: str,
-        caption_model_name: str = "blip2-2.7b"
+        caption_model_name: str = "blip2-2.7b",
+        low_memory: bool = False,
 ) -> str:
     global MODEL
     if MODEL is not None:
@@ -29,6 +29,12 @@ def load_model(
     config.chunk_size = 2048
     config.flavor_intermediate_count = 512
     config.blip_num_beams = 64
+    config.cache_path = os.path.join(os.path.dirname(__file__), "cache")
+    if not os.path.exists(config.cache_path):
+        os.mkdir(config.cache_path)
+    if low_memory:
+        config.apply_low_vram_defaults()
+        config.chunk_size = 1024
     ci = Interrogator(config=config)
 
     MODEL = ci
@@ -49,8 +55,6 @@ def image2text_from_files(file_mode: str, mode: str, input_dir: str, image_path:
 
 
 def image2text(file_mode: str, mode: str, fns: list[str | os.PathLike]):
-    global MODEL
-
     fmode = "w+"
     if file_mode == 'convert':
         fmode = "w+"
@@ -88,24 +92,32 @@ def image2text(file_mode: str, mode: str, fns: list[str | os.PathLike]):
     return images_tags
 
 
+def image_analysis(image, topk=5):
+    global MODEL
+    ci = MODEL
+
+    image = image.convert('RGB')
+    image_features = ci.image_to_features(image)
+
+    top_mediums = ci.mediums.rank(image_features, topk)
+    top_artists = ci.artists.rank(image_features, topk)
+    top_movements = ci.movements.rank(image_features, topk)
+    top_trendings = ci.trendings.rank(image_features, topk)
+    top_flavors = ci.flavors.rank(image_features, topk)
+
+    medium_ranks = {medium: sim for medium, sim in zip(top_mediums, ci.similarities(image_features, top_mediums))}
+    artist_ranks = {artist: sim for artist, sim in zip(top_artists, ci.similarities(image_features, top_artists))}
+    movement_ranks = {movement: sim for movement, sim in
+                      zip(top_movements, ci.similarities(image_features, top_movements))}
+    trending_ranks = {trending: sim for trending, sim in
+                      zip(top_trendings, ci.similarities(image_features, top_trendings))}
+    flavor_ranks = {flavor: sim for flavor, sim in zip(top_flavors, ci.similarities(image_features, top_flavors))}
+
+    return medium_ranks, artist_ranks, movement_ranks, trending_ranks, flavor_ranks
+
+
 def clip_image2text_ui():
     with gr.Row():
-        blip_model = gr.Dropdown(
-            label="blip model",
-            value="blip-large",
-            choices=[
-                "blip-base",
-                "blip-large",
-                "blip2-2.7b",
-                "blip2-flan-t5-xl",
-                "git-large-coco"
-            ]
-        )
-        clip_model = gr.Dropdown(
-            label="clip model",
-            choices=["ViT-L-14/openai", "ViT-H-14/laion2b_s32b_b79k", "ViT-bigG-14/laion2b_s39b_b160k"],
-            value="ViT-bigG-14/laion2b_s39b_b160k"
-        )
         mode = gr.Dropdown(
             label="mode",
             choices=["best", "classic", "fast", "negative"],
@@ -116,8 +128,6 @@ def clip_image2text_ui():
             choices=["append", "convert", "ignore"],
             value="convert"
         )
-        status = gr.Textbox(label="status", value="", lines=1)
-        load_model_btn = gr.Button(label="load model", value="load model")
 
     with gr.Row():
         input_dir = gr.Textbox(label="input dir", value="")
@@ -133,16 +143,50 @@ def clip_image2text_ui():
         inputs=[file_mode, mode, input_dir, input_image],
         outputs=[datas]
     )
-    load_model_btn.click(
-        load_model,
-        inputs=[clip_model, blip_model],
-        outputs=[status]
-    )
 
 
 if __name__ == '__main__':
     with gr.Blocks() as app:
+        with gr.Row():
+            blip_model = gr.Dropdown(
+                label="blip model",
+                value="blip-large",
+                choices=[
+                    "blip-base",
+                    "blip-large",
+                    "blip2-2.7b",
+                    "blip2-flan-t5-xl",
+                    "git-large-coco"
+                ]
+            )
+            clip_model = gr.Dropdown(
+                label="clip model",
+                choices=["ViT-L-14/openai", "ViT-H-14/laion2b_s32b_b79k", "ViT-bigG-14/laion2b_s39b_b160k"],
+                value="ViT-bigG-14/laion2b_s39b_b160k"
+            )
+            low_memory = gr.Checkbox(label="low memory", value=False)
+            status = gr.Textbox(label="status", value="", lines=1)
+            load_model_btn = gr.Button(label="load model", value="load model")
+
         with gr.Tab("image2text"):
             clip_image2text_ui()
-
+        with gr.Tab("image_analyzer"):
+            with gr.Column():
+                with gr.Row():
+                    topk = gr.Slider(label="topk", min=1, max=20, value=10)
+                with gr.Row():
+                    image = gr.Image(type='pil', label="Image")
+                with gr.Row():
+                    medium = gr.Label(label="Medium", num_top_classes=20)
+                    artist = gr.Label(label="Artist", num_top_classes=20)
+                    movement = gr.Label(label="Movement", num_top_classes=20)
+                    trending = gr.Label(label="Trending", num_top_classes=20)
+                    flavor = gr.Label(label="Flavor", num_top_classes=20)
+            button = gr.Button("Analyze")
+            button.click(image_analysis, inputs=[image, topk], outputs=[medium, artist, movement, trending, flavor])
+        load_model_btn.click(
+            load_model,
+            inputs=[clip_model, blip_model, low_memory],
+            outputs=[status]
+        )
     app.launch(enable_queue=False, share=False, inbrowser=True)
